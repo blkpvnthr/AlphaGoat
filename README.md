@@ -53,7 +53,7 @@ Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a
 - Generate API keys
 - Click API Keys → Generate Key
 - Copy API Key ID and Secret Key.
-- Store the keys as environment variables (recommended)
+- Store the keys as environment variables (.env file recommended)
   
 ```bash
   export ALPACA_API_KEY_ID="your_key_id"
