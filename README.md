@@ -61,7 +61,6 @@ Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a
 ```
 
 > On macOS you can add these to ~/.zshrc or ~/.bash_profile to persist.
-
 <\br>
 
 3. **Train & evaluate**
