@@ -104,14 +104,11 @@ No command-line arguments required—edit and run.
 
 ## 🧠 Roadmap
 
- Transformer/TCN generator option
-
- Diffusion-based price generator
-
- Additional RL algorithms (PPO, SAC)
-
- Automated hyper-parameter sweeps
-
+- Transformer/TCN generator option
+- Diffusion-based price generator
+- Additional RL algorithms (PPO, SAC)
+- Automated hyper-parameter sweeps
+  
  ---
 
 ## 🪪 License
