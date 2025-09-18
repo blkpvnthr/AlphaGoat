@@ -114,8 +114,7 @@ AlphaGoat/
 
 MIT License © 2025 BLKPVNTHR
 
-
-<span style="color: gray">Disclaimer</span>
+> **Disclaimer**
 
 > This project is for research and educational purposes only.
 > It is not investment advice and should not be used for live trading.
