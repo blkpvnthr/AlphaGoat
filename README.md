@@ -115,7 +115,6 @@ No command-line arguments required—edit and run.
 
 MIT License © 2025 BLKPVNTHR
 
----
 
 Disclaimer 
 
