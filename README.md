@@ -47,7 +47,7 @@ to create realistic intraday market data and train trading agents end-to-end.
 
 - Sign up
 Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a> and create a free account.
-> (choose Paper Trading if you don’t plan to trade real money).
+    > (choose Paper Trading if you don’t plan to trade real money).
 
 - Verify your email & log in.
 - Generate API keys
