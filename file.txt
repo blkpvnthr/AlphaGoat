@@ -1,0 +1,14 @@
+# Core numerical / data packages
+numpy>=1.24
+pandas>=2.1
+matplotlib>=3.7
+
+# Deep learning
+tensorflow>=2.15
+
+# Market data
+alpaca-py>=0.14
+yfinance>=0.2.36
+
+# Optional: progress bars / utils
+tqdm>=4.66
