@@ -81,7 +81,16 @@ Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a
    - Evaluates on live Alpaca data and saves trade plots in rl_agent/
   
 ---
-<pre> 📂 Repository Layout AlphaGoat/ ├─ rl_trader.py # main training & evaluation script ├─ gang-gang.py # original GAN training script ├─ models/ # trained generator & RL policy checkpoints ├─ output/ # equity curves, trade logs, plots └─ requirements.txt # project dependencies </pre>
+
+## 📂 Repository Layout
+<pre> 
+AlphaGoat/
+├─ rl_trader.py        # main training & evaluation script
+├─ gang-gang.py        # original GAN training script
+├─ models/             # trained generator & RL policy checkpoints
+├─ output/             # equity curves, trade logs, plots
+└─ file.txt
+</pre>
 
 ---
 
