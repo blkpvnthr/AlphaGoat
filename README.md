@@ -81,20 +81,17 @@ Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a
    - Evaluates on live Alpaca data and saves trade plots in rl_agent/
   
 ---
+<pre> 📂 Repository Layout AlphaGoat/ ├─ rl_trader.py # main training & evaluation script ├─ gang-gang.py # original GAN training script ├─ models/ # trained generator & RL policy checkpoints ├─ output/ # equity curves, trade logs, plots └─ requirements.txt # project dependencies </pre>
 
-## 📂 Repository Layout
-AlphaGoat/
-├─ rl_trader.py        # main training & evaluation script
-├─ gang-gang.py        # original GAN training script
-├─ models/             # trained generator & RL policy checkpoints
-├─ output/             # equity curves, trade logs, plots
-└─ file.txt
+---
 
 ## ⚙️ Configuration
 
 All runtime settings live at the top of rl_trader.py as plain Python variables
 (e.g. tickers, training episodes, cost parameters).
 No command-line arguments required—edit and run.
+
+---
 
 ## 🧠 Roadmap
 
@@ -106,9 +103,13 @@ No command-line arguments required—edit and run.
 
  Automated hyper-parameter sweeps
 
+ ---
+
 ## 🪪 License
 
-MIT License © 2025 [Your Name]
+MIT License © 2025 BLKPVNTHR
+
+---
 
 ## Disclaimer
 
