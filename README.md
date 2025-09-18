@@ -1,6 +1,7 @@
 # 🐐 AlphaGoat
 
-**AlphaGoat** is a full-stack **quant research and trading sandbox** that fuses **Generative Adversarial Networks (GANs)** with **Reinforcement Learning (RL)** to create realistic intraday market data and train trading agents end-to-end.
+**AlphaGoat** is a full-stack **quant research and trading sandbox** that fuses **Generative Adversarial Networks (GANs)** with **Reinforcement Learning (RL)** to create realistic intraday market data and train trading agents 
+end-to-end.
 
 ---
 
