@@ -96,7 +96,7 @@ AlphaGoat/
 
 ## ⚙️ Configuration
 
-- All runtime settings live at the top of rl_trader.py as plain Python variables
+- All runtime settings live at the top of `.py` files as plain Python variables
     > (e.g. tickers, training episodes, cost parameters).
 - No command-line arguments required—edit and run.
 
