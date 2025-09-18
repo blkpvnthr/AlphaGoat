@@ -86,7 +86,6 @@ Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a
 AlphaGoat/
 ├─ rl_trader.py        # main training & evaluation script
 ├─ gang-gang.py        # original GAN training script
-├─ models/             # trained generator & RL policy checkpoints
 ├─ output/             # equity curves, trade logs, plots
 └─ file.txt
 </pre>
