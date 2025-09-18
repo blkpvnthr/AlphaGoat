@@ -38,16 +38,14 @@ to create realistic intraday market data and train trading agents end-to-end.
     cd AlphaGoat
     pip install -r file.txt
  ```
-
  > These versions are broad enough to stay compatible with current macOS/Linux setups while ensuring TensorFlow ≥ 2.15 for tf.keras features.
-
-
+ 
 2. **Create an Alpaca account & API keys**
 
 AlphaGoat needs live 1-minute market data. Follow these steps:
 
 Sign up
-Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a> and create a free account
+Go to <a href="https://alpaca.markets" target="_blank">https://alpaca.markets</a> and create a free account.
 > (choose Paper Trading if you don’t plan to trade real money).
 
 - Verify your email & log in.
