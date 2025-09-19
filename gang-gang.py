@@ -117,7 +117,7 @@ IBM_CHANNEL          = "ibm_quantum"
 IBM_INSTANCE         = "ibm-q/open/main"
 IBM_SHOTS            = 2000
 IBM_MAX_BATCH        = 32
-
+latent_dim = 64 # latent_dim must match the MyGenerator definition below
 # Optional config (YAML) — if present, will override anything above
 CONFIG_YAML_PATH     = "configs/pro.yaml"
 # ============================================================================
@@ -376,6 +376,81 @@ def load_alpaca_1m_df(
         raise last_err
     raise RuntimeError("Unknown error while fetching Alpaca bars.")
 # ------------------------------------------------------------
+# ==============================================
+# Quantum feature configuration (starter version)
+# ==============================================
+
+# Toggle this to enable/disable quantum features at runtime
+USE_QUANTUM_FEATURES: bool = True
+
+# Attempt to import Qiskit once and fall back gracefully if it's not available.
+# This makes the module safe to import on systems without qiskit installed.
+try:
+    from qiskit_aer import Aer
+    from qiskit.circuit.library import ZZFeatureMap
+    from qiskit.utils import QuantumInstance
+    from qiskit import execute, QuantumCircuit
+    try:
+        QUANTUM_BACKEND = Aer.get_backend("statevector_simulator")
+    except Exception:
+        QUANTUM_BACKEND = None
+except Exception:
+    # qiskit not available: disable quantum features and provide safe placeholders
+    ZZFeatureMap = None
+    QuantumInstance = None
+    execute = None
+    QuantumCircuit = None
+    QUANTUM_BACKEND = None
+    if USE_QUANTUM_FEATURES:
+        print("[quantum] qiskit not available; disabling quantum features.")
+    USE_QUANTUM_FEATURES = False
+
+def quantum_feature_map(sample_vec, backend=QUANTUM_BACKEND) -> np.ndarray:
+    """
+    Encode a 1-D numpy vector into a quantum feature map and return the statevector
+    when Qiskit is available; otherwise return a deterministic normalized complex
+    fallback vector so downstream code can continue to run without qiskit.
+
+    sample_vec : 1-D numpy array of floats
+    backend    : Qiskit backend (default: statevector simulator) or None
+    Returns    : complex numpy array (statevector or deterministic fallback)
+    """
+    # Ensure input is a 1-D numpy array
+    x = np.array(sample_vec, dtype=float).ravel()
+    num_qubits = max(1, int(len(x)))
+
+    # If qiskit or backend is not available, return a deterministic normalized fallback
+    if not USE_QUANTUM_FEATURES or ZZFeatureMap is None or backend is None or execute is None:
+        # Fallback length: prefer 2**num_qubits but cap to avoid huge arrays
+        max_qubits = 10
+        nq = min(num_qubits, max_qubits)
+        out_len = 2 ** nq if nq > 0 else 1
+        flat = np.zeros(out_len, dtype=float)
+        ncopy = min(len(x), out_len)
+        if ncopy > 0:
+            flat[:ncopy] = x[:ncopy]
+        norm = np.linalg.norm(flat)
+        if norm > 0:
+            flat = flat / norm
+        else:
+            # deterministic non-zero fallback
+            flat[0] = 1.0
+        return flat.astype(np.complex64)
+
+    # Build a simple feature map circuit with as many qubits as features
+    feature_map = ZZFeatureMap(feature_dimension=num_qubits, reps=1)
+    qc = feature_map.assign_parameters(x)
+
+    # Run circuit to get statevector
+    job = execute(qc, backend)
+    result = job.result()
+    try:
+        statevector = result.get_statevector(qc, decimals=8)
+    except Exception:
+        # some backends return without needing the circuit arg
+        statevector = result.get_statevector()
+    # Convert to np.ndarray of complex numbers
+    return np.array(statevector, dtype=np.complex64)
 
 # ------------------- Indicators & helpers ----------------------
 # After you load the first ticker df (post-aggregation), compute a safe SEQ_LEN:
@@ -390,7 +465,39 @@ def infer_safe_seq_len(df, floor=32, frac=0.75):
 first_df = load_alpaca_1m_df(TICKERS[0], days=DAYS_BACK, tz=TIMEZONE, regular_hours_only=REG_HOURS_ONLY)
 SEQ_LEN = infer_safe_seq_len(first_df, floor=32, frac=0.75)
 print(f"[auto] SEQ_LEN set to {SEQ_LEN} based on available bars.")
+# When sampling noise for generator input
+z = np.random.normal(0, 1, (BATCH_SIZE, latent_dim)).astype(np.float32)
+def my_generator(latent_dim, cond_dim):
+    z_in = tf.keras.Input(shape=(latent_dim,))
+    c_in = tf.keras.Input(shape=(cond_dim,))
+    # Define your generator architecture here
+    x = tf.keras.layers.Dense(128, activation='relu')(z_in)
+    x = tf.keras.layers.Concatenate()([x, c_in])
+    x = tf.keras.layers.Dense(SEQ_LEN * 3)(x)
+    return tf.keras.Model(inputs=[z_in, c_in], outputs=x)
 
+# Define the generator before using it
+latent_dim = 64  # Ensure this matches your latent_dim definition
+# Define a placeholder or valid conditioning input for `bc`
+# Define FZ_DIM based on the feature dimension; use a safe fallback if core_feat_names
+# isn't defined yet (this placeholder will be corrected later once features are built).
+FZ_DIM = max(1, len(globals().get("core_feat_names", [])))  # safe fallback to at least 1
+
+# Create an example sequence conditioning tensor (time x features)
+bc_seq = np.random.normal(0, 1, (BATCH_SIZE, SEQ_LEN, FZ_DIM)).astype(np.float32)  # Example conditioning input
+
+# The simple builder above expects a per-sample conditioning vector (shape: [B, FZ_DIM]),
+# so reduce the temporal dimension (e.g. by averaging) to form bc_vec.
+bc_vec = np.mean(bc_seq, axis=1).astype(np.float32)  # shape: (BATCH_SIZE, FZ_DIM)
+
+cond_dim = bc_vec.shape[-1]  # now matches the builder's expectation
+
+# Instantiate the model into a clearly named variable to avoid shadowing the builder
+simple_gen = my_generator(latent_dim, cond_dim)
+
+# Call the generator model with a single list argument [z, bc_vec]
+fake_samples = simple_gen([z, bc_vec])
+# --------------------------------------------------------------------
 def ema(s, span): return s.ewm(span=span, adjust=False).mean()
 
 def to_returns(close):
@@ -733,108 +840,205 @@ def make_windows_sessionwise(idx: pd.DatetimeIndex, arr2d: np.ndarray, L: int):
     return make_windows_no_cross(idx, arr2d, L)
 
 def regime_id_from_row(rowdict):
-    b = int(rowdict["bull"]>0.5)
+    b = int(rowdict["bull"] > 0.5)
     # vol quartile one-hot in positions rv_q1..rv_q4
-    q = [rowdict.get(f"rv_q{i}",0.0) for i in [1,2,3,4]]
-    rvq = int(np.argmax(q))+1
-    vb = [rowdict.get("vix_b1",0.0), rowdict.get("vix_b2",0.0), rowdict.get("vix_b3",0.0)]
-    vbi = int(np.argmax(vb))+1
+    q = [rowdict.get(f"rv_q{i}", 0.0) for i in [1, 2, 3, 4]]
+    rvq = int(np.argmax(q)) + 1
+    vb = [
+        rowdict.get("vix_b1", 0.0),
+        rowdict.get("vix_b2", 0.0),
+        rowdict.get("vix_b3", 0.0),
+    ]
+    vbi = int(np.argmax(vb)) + 1
     key = (b, rvq, vbi)
     if key not in REGIME_IDS:
-        REGIME_IDS[key] = len(REGIME_IDS)%REGIME_EMB.shape[0]
+        REGIME_IDS[key] = len(REGIME_IDS) % REGIME_EMB.shape[0]
     return REGIME_IDS[key]
 
+
 for i, m in enumerate(meta):
-    rets_i = ret_vecs[i]; F_core = feat_mats[i]; idx = indexes[i]
+    rets_i = ret_vecs[i]
+    F_core = feat_mats[i]
+    idx = indexes[i]
 
     # per-ticker standardization
     xz = standardize_with(rets_i, ret_stats[i][0], ret_stats[i][1])
-    Fz_cols = [ standardize_with(F_core[:, j], feat_stats[i][j][0], feat_stats[i][j][1]) for j in range(F_core.shape[1]) ]
+    Fz_cols = [
+        standardize_with(F_core[:, j], feat_stats[i][j][0], feat_stats[i][j][1])
+        for j in range(F_core.shape[1])
+    ]
     Fz = np.stack(Fz_cols, axis=1)
 
     # Session-aware windows
-    Xw, seq_idx = make_windows_sessionwise(idx, xz.reshape(-1,1), SEQ_LEN)
-    if len(Xw)==0: continue
+    Xw, seq_idx = make_windows_sessionwise(idx, xz.reshape(-1, 1), SEQ_LEN)
+    if len(Xw) == 0:
+        continue
 
-    # Optional quantum (not expanded here for brevity) — reuse from earlier versions if needed
+    # ---------- Optional quantum section (re-added) ----------
+    if USE_QUANTUM_FEATURES:
+        # build quantum states from standardized returns
+        # e.g. encode price changes into qubit amplitudes
+        q_states = []
+        for w in Xw:
+            # normalise to unit length for valid state
+            norm = np.linalg.norm(w)
+            q_state = w / norm if norm > 0 else w
+            q_states.append(q_state)
+        q_states = np.array(q_states, dtype=np.float32)
+
+        # example: apply predefined parameterized circuit / feature map
+        q_embs = []
+        for s in q_states:
+            emb = quantum_feature_map(s, backend=QUANTUM_BACKEND)
+            q_embs.append(emb)
+        q_embs = np.stack(q_embs, axis=0).astype(np.float32)
+    else:
+        q_embs = None
+    # --------------------------------------------------------
 
     # Fz windows
     Fz_w, _ = make_windows_sessionwise(idx, Fz, SEQ_LEN)
 
     # Build auxiliary embeddings per window
-    # Ticker emb
+    # Ticker embedding
     if USE_TICKER_EMBEDDING:
         emb_vec = TICK_EMB[tic_to_ix[m["ticker"]]]
         emb_block = np.tile(emb_vec, (len(Xw), SEQ_LEN, 1)).astype(np.float32)
     else:
         oh = np.zeros((len(Xw), SEQ_LEN, n_tickers), dtype=np.float32)
-        oh[:,:,tic_to_ix[m["ticker"]]] = 1.0
+        oh[:, :, tic_to_ix[m["ticker"]]] = 1.0
+            # ---------- build regime embedding windows (optional) ----------
+    reg_blk = None
+    if USE_REGIME_EMBEDDING and 'REGIME_EMB' in globals() and REGIME_EMB is not None:
+        # pull column indices for regime fields from your core_feat_names mapping
+        bull_ix = core_name_to_idx["bull"]
+        rv_ix   = [core_name_to_idx[f"rv_q{i}"] for i in [1,2,3,4]]
+        vix_ix  = [core_name_to_idx["vix_b1"], core_name_to_idx["vix_b2"], core_name_to_idx["vix_b3"]]
 
-    # Sector emb
-    if USE_SECTOR_EMBEDDING:
-        sector_ix = sector_to_ix[m["sector"]]
-        sect_vec = SECTOR_EMB[sector_ix]
-        sect_block = np.tile(sect_vec, (len(Xw), SEQ_LEN, 1)).astype(np.float32)
+        # We'll use the standardized feature matrix (Fz) for thresholds (0/1-like already)
+        # Build per-window regime ids using seq_idx returned from the SAME call that made Xw
+        reg_ids_w = []
+        for (s, e) in seq_idx:  # each is a pair (start, end) of indices into original rows
+            rids = []
+            for k in range(s, e):
+                rowdict = {
+                    "bull":  float(Fz[k, bull_ix]),
+                    "rv_q1": float(Fz[k, rv_ix[0]]),
+                    "rv_q2": float(Fz[k, rv_ix[1]]),
+                    "rv_q3": float(Fz[k, rv_ix[2]]),
+                    "rv_q4": float(Fz[k, rv_ix[3]]),
+                    "vix_b1": float(Fz[k, vix_ix[0]]),
+                    "vix_b2": float(Fz[k, vix_ix[1]]),
+                    "vix_b3": float(Fz[k, vix_ix[2]]),
+                }
+                rids.append(regime_id_from_row(rowdict))
+            reg_ids_w.append(rids)
+        reg_ids_w = np.asarray(reg_ids_w, dtype=np.int32)     # (N_w, SEQ_LEN)
+        reg_blk   = REGIME_EMB[reg_ids_w]                     # (N_w, SEQ_LEN, REGIME_EMB_DIM)
 
-    # Regime emb id per timestep (use Fz original values before z-score to extract booleans cleanly)
-    if USE_REGIME_EMBEDDING:
-        # reconstruct dict per row using original (unscaled) core array for regime flags
-        raw = F_core  # unscaled
-        kv_names = ["bull","rv_q1","rv_q2","rv_q3","rv_q4","vix_b1","vix_b2","vix_b3"]
-        # build ids at row-level, then window them
-        ids = []
-        for r in range(raw.shape[0]):
-            d = dict(zip(core_feat_names, raw[r]))
-            ids.append(regime_id_from_row(d))
-        ids = np.array(ids)
-        # window ids
-        ids_w = []
-        for s,e in seq_idx:
-            ids_w.append(ids[s:e])
-        ids_w = np.array(ids_w)  # (N,L)
-        reg_block = REGIME_EMB[ids_w]  # (N,L,REGIME_EMB_DIM)
+    # ---------- ticker embedding block must be named emb_block ----------
+    if USE_TICKER_EMBEDDING:
+        emb_block = emb_block                                 # already built above
+    else:
+        emb_block = oh                                        # use one-hot built above
 
-    # is_fake block
-    is_fake_w = np.full((len(Xw), SEQ_LEN, 1), 1.0 if m["is_fake"] else 0.0, dtype=np.float32)
+    # ---------- quantum embedding to per-timestep ----------
+    q_blk = None
+    if q_embs is not None:
+        # if q_embs is (N_w, q_dim) expand across time; if already (N_w, L, q_dim) keep it
+        if q_embs.ndim == 2:
+            q_blk = np.repeat(q_embs[:, None, :], SEQ_LEN, axis=1)
+        elif q_embs.ndim == 3:
+            q_blk = q_embs
+        else:
+            # unknown shape -> skip safely
+            q_blk = None
 
-    # Compose conditioning
-    parts = [Fz_w]
-    if USE_TICKER_EMBEDDING: parts.append(emb_block)
-    else: parts.append(oh)
-    if USE_SECTOR_EMBEDDING: parts.append(sect_block)
-    if USE_REGIME_EMBEDDING: parts.append(reg_block)
-    parts.append(is_fake_w)
-    Cw = np.concatenate(parts, axis=-1)
+    # ---------- align lengths and concatenate conditioning ----------
+    parts = [Fz_w, emb_block]
+    if reg_blk is not None: parts.append(reg_blk)
+    if q_blk   is not None: parts.append(q_blk)
+    minN = min([p.shape[0] for p in parts])
 
-    X_by_ticker[m["ticker"]] = Xw
-    C_by_ticker[m["ticker"]] = Cw
-    per_ticker_counts[m["ticker"]] = len(Xw)
+    # trim everything to the same window count
+    Xw        = Xw[:minN]                     # (N_w, L, 1)
+    Fz_w      = Fz_w[:minN]                   # (N_w, L, F_core)
+    emb_block = emb_block[:minN]              # (N_w, L, tick_dim)
+    if reg_blk is not None: reg_blk = reg_blk[:minN]
+    if q_blk   is not None: q_blk   = q_blk[:minN]
 
-if not X_by_ticker:
-    raise RuntimeError("No training windows constructed.")
+    cond_list = [Fz_w, emb_block]
+    if reg_blk is not None: cond_list.append(reg_blk)
+    if q_blk   is not None: cond_list.append(q_blk)
+    Cw = np.concatenate(cond_list, axis=-1).astype(np.float32)  # (N_w, L, cond_dim)
 
-cond_dim = next(iter(C_by_ticker.values())).shape[-1]
-FZ_DIM = feat_mats[0].shape[1]  # core feat dim (z-scored) — used for event dropout boundary
+    # ---------- STORE into dicts so the batcher can see them ----------
+    t = m["ticker"]
+    X_by_ticker[t] = Xw.astype(np.float32)
+    C_by_ticker[t] = Cw
+    per_ticker_counts[t] = int(len(Xw))
+    print(f"{t}: windows={len(Xw)}, last_price={m['last_price']:.2f}, sector={m['sector']}")
+    # -------------------- Batching (balanced) ----------------------
+    def get_balanced_batches(X_by_ticker: dict, C_by_ticker: dict, bs: int):
+        """
+        Yield (X_batch, C_batch) with roughly equal samples per ticker.
+    X_by_ticker[t] -> np.ndarray of shape (N_t, SEQ_LEN, xdim)
+    C_by_ticker[t] -> np.ndarray of shape (N_t, cond_dim) or (N_t, SEQ_LEN, cond_dim)
+    """
+        # 1) Keep only tickers that actually have data and matching counts
+        tickers = []
+        diag = {}
+        for t, X in X_by_ticker.items():
+            nX = 0 if X is None else len(X)
+            nC = 0 if (t not in C_by_ticker or C_by_ticker[t] is None) else len(C_by_ticker[t])
+            diag[t] = (nX, nC)
+            if nX > 0 and nC == nX:
+                tickers.append(t)
+    
+        Tn = len(tickers)
+        if Tn == 0:
+            # Helpful diagnostic so you can see what's empty/mismatched
+            raise ValueError(
+                "No tickers available for batching. Check your window creation/conditioning.\n"
+                + "\n".join([f"{t}: X={nx}, C={nc}" for t, (nx, nc) in diag.items()])
+            )
+    
+        # 2) Allocate samples per ticker (evenly distributed)
+        base = bs // Tn
+        rem  = bs - base * Tn
+        # Example: if bs=128 and Tn=5 -> base=25, rem=3 -> 3 tickers get 26, 2 tickers get 25
+    
+        # 3) Sample (with replacement if needed) and build the batch
+        X_parts, C_parts = [], []
+        for i, t in enumerate(tickers):
+            need = base + (1 if i < rem else 0)
+            X = X_by_ticker[t]
+            C = C_by_ticker[t]
+            n = len(X)
+    
+            if n == 0:
+                continue  # shouldn't happen due to filter, but safe
+    
+            # With replacement lets you keep batch size even if a ticker has few windows
+            idx = np.random.randint(0, n, size=need)
+    
+            X_parts.append(X[idx])
+            C_parts.append(C[idx])
+    
+        if not X_parts:
+            # Fallback (shouldn't happen unless all tickers were empty)
+            raise ValueError("Failed to assemble batch: no parts collected.")
+    
+        Xb = np.concatenate(X_parts, axis=0)
+        Cb = np.concatenate(C_parts, axis=0)
+    
+        # 4) Shuffle within-batch to avoid per-ticker blocks
+        p = np.random.permutation(len(Xb))
+        Xb = Xb[p]
+        Cb = Cb[p]
+    
+        yield Xb, Cb
 
-print(f"Cond dim: {cond_dim} | Core feat dim: {FZ_DIM}")
-print("Per-ticker windows:", per_ticker_counts)
-
-# -------------------- Batching (balanced) ----------------------
-def get_balanced_batches(X_by, C_by, bs):
-    tic = list(X_by.keys()); Tn = len(tic)
-    base = bs // Tn; rem = bs - base*Tn
-    shares = [base + (1 if k<rem else 0) for k in range(Tn)]
-    total = sum(len(X_by[t]) for t in tic)
-    nb = max(1, total//bs)
-    for _ in range(nb):
-        xs, cs = [], []
-        for k,t in enumerate(tic):
-            n = shares[k]; N = len(X_by[t])
-            idx = np.random.randint(0, N, size=n)
-            xs.append(X_by[t][idx]); cs.append(C_by[t][idx])
-        bx = np.concatenate(xs,0); bc = np.concatenate(cs,0)
-        perm = np.random.permutation(len(bx))
-        yield bx[perm], bc[perm]
 
 # ----------------- Robustness (dropout, noise, mixup) ----------
 def apply_event_dropout(bc, event_cols, p, fz_dim):
@@ -885,7 +1089,13 @@ def maybe_mixup(bx, bc, p: float, alpha: float):
 
     return tf.cond(u < p, _do_mixup, lambda: (bx, bc))
 
-
+if USE_QUANTUM_FEATURES:
+    vec = np.random.rand(4)        # example 4-dimensional sample
+    emb = quantum_feature_map(vec)  # complex statevector
+    print(emb.shape)                # length = 2**num_qubits
+    print(emb.dtype)                # complex64
+    print(np.sum(np.abs(emb)**2))   # should be 1.0 (unit norm)
+    print(emb)                      # example output
 # --------------------- Models (LSTM/TCN/Transformer) -----------
 def block_tcn(x, ch=128, k=3, d=1, dropout=0.05):
     h = Conv1D(ch, k, padding="causal", dilation_rate=d)(x)
@@ -994,7 +1204,25 @@ def build_critic(Fdim):
     out = Dense(1)(h)  # linear
     return Model([x_in, c_in], out, name="C")
 
+# Define cond_dim based on the dimensions of the conditioning features
+core_dim = Fz_w.shape[2]
+reg_dim = REGIME_EMB.shape[1]
+tick_dim = TICK_EMB.shape[1]
+q_dim = 0 if q_embs is None else q_embs.shape[2]
+
+cond_dim = core_dim + reg_dim + tick_dim + q_dim
+print("cond_dim =", cond_dim)
+
 G = build_generator(cond_dim)
+# Define cond_dim based on the dimensions of the conditioning features
+core_dim = Fz_w.shape[2]
+reg_dim = REGIME_EMB.shape[1]
+tick_dim = TICK_EMB.shape[1]
+q_dim = 0 if q_embs is None else q_embs.shape[2]
+
+cond_dim = core_dim + reg_dim + tick_dim + q_dim
+print("cond_dim =", cond_dim)
+
 C = build_critic(cond_dim)
 print(G.summary())
 print(C.summary())
@@ -1104,6 +1332,73 @@ def acf_penalty(x, y, max_lag=10):
     return pen
 
 # ================== GAN steps (define BEFORE training loop) ==================
+def my_generator(latent_dim, cond_dim):
+    z = tf.keras.Input(shape=(latent_dim,))
+    c = tf.keras.Input(shape=(cond_dim,))
+    # Define your generator architecture here
+    x = tf.keras.layers.Dense(128, activation='relu')(z)
+    x = tf.keras.layers.Concatenate()([x, c])
+    x = tf.keras.layers.Dense(SEQ_LEN * 3)(x)
+    return tf.keras.Model(inputs=[z, c], outputs=x)
+def my_critic(cond_dim):
+    x = tf.keras.Input(shape=(SEQ_LEN, 1))
+    c = tf.keras.Input(shape=(cond_dim,))
+    # Define your critic architecture here
+    y = tf.keras.layers.Flatten()(x)
+    y = tf.keras.layers.Concatenate()([y, c])
+    y = tf.keras.layers.Dense(128, activation='relu')(y)
+    y = tf.keras.layers.Dense(1)(y)
+    return tf.keras.Model(inputs=[x, c], outputs=y)
+
+# Shapes:
+# Xw has shape (n_windows, SEQ_LEN, 1)
+# Fz_w has shape (n_windows, SEQ_LEN, n_feat_core)
+# Ensure reg_emb is defined properly elsewhere in the code
+# Example: reg_emb = np.zeros((n_windows, SEQ_LEN, reg_emb_dim), dtype=np.float32)
+# Uncomment and replace the following line with the correct initialization if needed:
+# reg_emb = np.zeros((n_windows, SEQ_LEN, reg_emb_dim), dtype=np.float32)
+# emb_block has shape (n_windows, SEQ_LEN, tick_emb_dim)
+q_embs: Optional[np.ndarray]  # Expected shape: (n_windows, SEQ_LEN, q_emb_dim) or None
+def my_generator(latent_dim, cond_dim):
+    z = tf.keras.Input(shape=(latent_dim,))
+    c = tf.keras.Input(shape=(cond_dim,))
+    # Define your generator architecture here
+    x = tf.keras.layers.Dense(128, activation='relu')(z)
+    x = tf.keras.layers.Concatenate()([x, c])
+    x = tf.keras.layers.Dense(SEQ_LEN * 3)(x)
+    return tf.keras.Model(inputs=[z, c], outputs=x)
+def my_critic(cond_dim):
+    x = tf.keras.Input(shape=(SEQ_LEN, 1))
+    c = tf.keras.Input(shape=(cond_dim,))
+    # Define your critic architecture here
+    y = tf.keras.layers.Flatten()(x)
+    y = tf.keras.layers.Concatenate()([y, c])
+    y = tf.keras.layers.Dense(128, activation='relu')(y)
+    y = tf.keras.layers.Dense(1)(y)
+    return tf.keras.Model(inputs=[x, c], outputs=y)
+# Determine cond_dim    
+core_dim = Fz_w.shape[2]
+reg_dim  = REGIME_EMB.shape[1]
+tick_dim = TICK_EMB.shape[1]
+q_dim    = 0 if q_embs is None else q_embs.shape[2]
+
+cond_dim = core_dim + reg_dim + tick_dim + q_dim
+print("cond_dim =", cond_dim)
+
+# Rebuild models with correct cond_dim
+G = build_generator(cond_dim)
+C = build_critic(cond_dim)
+print(G.summary())
+print(C.summary())
+print("Generator parameters: {:,}".format(np.sum([np.prod(v.shape) for v in G.trainable_variables])))
+print("Critic parameters:    {:,}".format(np.sum([np.prod(v.shape) for v in C.trainable_variables])))
+if USE_G_EMA:
+    G_EMA = tf.keras.models.clone_model(G); G_EMA.set_weights(G.get_weights())
+    C_EMA = tf.keras.models.clone_model(C); C_EMA.set_weights(C.get_weights())
+    print("EMA Generator parameters: {:,}".format(np.sum([np.prod(v.shape) for v in G_EMA.trainable_variables])))
+    print("EMA Critic parameters:    {:,}".format(np.sum([np.prod(v.shape) for v in C_EMA.trainable_variables])))
+    
+    
 @tf.function(experimental_compile=False) # add this on ALL of these
 def gradient_penalty(real_x, fake_x, cond):
     bs  = tf.shape(real_x)[0]
@@ -1176,6 +1471,7 @@ def generator_step(real_x, cond):
     grads, _ = tf.clip_by_global_norm(grads, 1.0)
     opt_g.apply_gradients(zip(grads, G.trainable_variables))
     return loss, adv, add
+
 # ----------------- Helper: finite check -----------------
 def _finite(x):
     try:
@@ -1187,17 +1483,135 @@ def _finite(x):
 
 # ----------------- mini-batch generator -----------------
 def training_batches():
-    """Yield one epoch of mini-batches (balanced or pooled)."""
-    if BALANCED_SAMPLING:
-        yield from get_balanced_batches(X_by_ticker, C_by_ticker, BATCH_SIZE)
-        return
-    X_all = np.concatenate(list(X_by_ticker.values()), axis=0)
-    C_all = np.concatenate(list(C_by_ticker.values()), axis=0)
-    nb = max(1, len(X_all) // BATCH_SIZE)
-    for _ in range(nb):
-        idx = np.random.randint(0, len(X_all), size=BATCH_SIZE)
-        yield X_all[idx], C_all[idx]
+    # Build fresh dicts each epoch if you re-window every epoch; else precompute once.
+    # X_by_ticker, C_by_ticker should be prepared before calling this.
+    total_windows = sum(len(X_by_ticker[t]) for t in X_by_ticker if X_by_ticker[t] is not None)
+    steps_per_epoch = max(1, total_windows // BATCH_SIZE)
 
+    for _ in range(steps_per_epoch):
+        # get_balanced_batches yields exactly one (Xb, Cb) per call above
+        yield from get_balanced_batches(X_by_ticker, C_by_ticker, BATCH_SIZE)
+
+        """Yield one epoch of mini-batches (balanced or pooled)."""
+        if BALANCED_SAMPLING:
+            yield from get_balanced_batches(X_by_ticker, C_by_ticker, BATCH_SIZE)
+            return
+        X_all = np.concatenate(list(X_by_ticker.values()), axis=0)
+        C_all = np.concatenate(list(C_by_ticker.values()), axis=0)
+        nb = max(1, len(X_all) // BATCH_SIZE)
+        for _ in range(nb):
+            idx = np.random.randint(0, len(X_all), size=BATCH_SIZE)
+            yield X_all[idx], C_all[idx]
+
+    def _diag_counts(X_by_ticker, C_by_ticker, label="_pretrain"):
+        print(f"[diag {label}] per-ticker window counts:")
+        for t in sorted(set(X_by_ticker.keys()) | set(C_by_ticker.keys())):
+            nx = len(X_by_ticker.get(t, [])) if X_by_ticker.get(t) is not None else 0
+            nc = len(C_by_ticker.get(t, [])) if C_by_ticker.get(t) is not None else 0
+            ok = "OK" if (nx == nc and nx > 0) else "BAD"
+            print(f"  {t:8s}  X={nx:5d}  C={nc:5d}  -> {ok}")
+    _diag_counts(X_by_ticker, C_by_ticker, label="before training")
+
+def build_training_inputs(meta, ret_vecs, feat_mats, indexes,
+                          SEQ_LEN,
+                          ret_stats, feat_stats,
+                          USE_TICKER_EMBEDDING,
+                          TICK_EMB, tic_to_ix, n_tickers,
+                          REGIME_EMB=None, regime_ids=None,
+                          q_embs_by_ticker=None):
+    """
+    Returns:
+      X_by_ticker[t] : (N_t, SEQ_LEN, 1)  standardized returns windows
+      C_by_ticker[t] : (N_t, SEQ_LEN, cond_dim) concatenated conditioning windows
+    All per-ticker lengths are trimmed to match.
+    """
+    X_by_ticker, C_by_ticker = {}, {}
+
+    for i, m in enumerate(meta):
+        t = m["ticker"]
+        rets_i = ret_vecs[i]
+        F_core = feat_mats[i]
+        idx    = indexes[i]
+
+        # --- standardize ---
+        xz = standardize_with(rets_i, ret_stats[i][0], ret_stats[i][1])
+        Fz_cols = [standardize_with(F_core[:, j], feat_stats[i][j][0], feat_stats[i][j][1])
+                   for j in range(F_core.shape[1])]
+        Fz = np.stack(Fz_cols, axis=1)
+
+        # --- window returns & features ---
+        Xw, seq_idx = make_windows_sessionwise(idx, xz.reshape(-1,1), SEQ_LEN)
+        if len(Xw) == 0:
+            continue
+        Fz_w, _ = make_windows_sessionwise(idx, Fz, SEQ_LEN)
+
+        # --- ticker embedding / one-hot ---
+        if USE_TICKER_EMBEDDING:
+            emb_vec   = TICK_EMB[tic_to_ix[t]]  # (tick_emb_dim,)
+            tick_blk  = np.tile(emb_vec, (len(Xw), SEQ_LEN, 1)).astype(np.float32)
+            tick_dim  = tick_blk.shape[-1]
+        else:
+            tick_blk  = np.zeros((len(Xw), SEQ_LEN, n_tickers), dtype=np.float32)
+            tick_blk[:, :, tic_to_ix[t]] = 1.0
+            tick_dim  = n_tickers
+
+        # --- regime embedding (optional) ---
+        # If you have per-row regimes aligned to original rows, map via seq_idx.
+        # Otherwise, skip and set reg_blk = None.
+        if REGIME_EMB is not None and regime_ids is not None:
+            # regime_ids must be per-row integers aligned with original data length
+            # Build regime id windows using seq_idx
+            reg_ids_w = []
+            for s in seq_idx:   # s is a slice/index list of length SEQ_LEN
+                # Here we assume s is a list/array of positions in the original series
+                rids = [regime_ids[k] for k in s]
+                reg_ids_w.append(rids)
+            reg_ids_w = np.array(reg_ids_w, dtype=np.int32)  # (N_w, SEQ_LEN)
+
+            # Lookup embedding
+            reg_blk = REGIME_EMB[reg_ids_w]  # shape (N_w, SEQ_LEN, reg_emb_dim)
+            reg_dim = reg_blk.shape[-1]
+        else:
+            reg_blk = None
+            reg_dim = 0
+
+        # --- quantum embedding (optional) ---
+        if q_embs_by_ticker is not None and t in q_embs_by_ticker and q_embs_by_ticker[t] is not None:
+            q_blk = q_embs_by_ticker[t]  # should already be (N_w, SEQ_LEN, q_dim) or (N_w, q_dim)
+            # If shape is (N_w, q_dim), expand to per-timestep:
+            if q_blk.ndim == 2:
+                q_blk = np.repeat(q_blk[:, None, :], SEQ_LEN, axis=1)
+            q_dim = q_blk.shape[-1]
+        else:
+            q_blk = None
+            q_dim = 0
+
+        # --- align lengths (trim to min) ---
+        N = len(Xw)
+        parts = [Fz_w, tick_blk]
+        if reg_blk is not None: parts.append(reg_blk)
+        if q_blk   is not None: parts.append(q_blk)
+
+        minN = min([N] + [p.shape[0] for p in parts if p is not None])
+        if minN == 0:
+            continue
+
+        Xw      = Xw[:minN]
+        Fz_w    = Fz_w[:minN]
+        tick_blk= tick_blk[:minN]
+        if reg_blk is not None: reg_blk = reg_blk[:minN]
+        if q_blk   is not None: q_blk   = q_blk[:minN]
+
+        # --- concat conditioning on last dim ---
+        cond_list = [Fz_w, tick_blk]
+        if reg_blk is not None: cond_list.append(reg_blk)
+        if q_blk   is not None: cond_list.append(q_blk)
+        Cw = np.concatenate(cond_list, axis=-1).astype(np.float32)
+
+        X_by_ticker[t] = Xw.astype(np.float32)
+        C_by_ticker[t] = Cw
+
+    return X_by_ticker, C_by_ticker
 # -------------------------- Training ---------------------------
 OUT_DIR = "output"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -1276,6 +1690,11 @@ for epoch in range(1, EPOCHS + 1):
               f"W {_last(hist['w']):.4f} | REG {_last(hist['gp']):.4f} | "
               f"ADV {_last(hist['adv']):.4f} | AUX {_last(hist['aux']):.4f} | LR {lr:.2e}")
         print(_last(hist['w']), _last(hist['gp']))
+    if USE_G_EMA:
+        print("EMA Generator parameters: {:,}".format(np.sum([np.prod(v.shape) for v in G_EMA.trainable_variables])))
+        print("EMA Critic parameters:    {:,}".format(np.sum([np.prod(v.shape) for v in C_EMA.trainable_variables])))
+
+
 # ========= Trade plotting helpers =========
 def gen_crossover_trades(prices: pd.Series, fast: int = 10, slow: int = 30) -> pd.DataFrame:
     """
