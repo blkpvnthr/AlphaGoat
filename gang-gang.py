@@ -1,4 +1,5 @@
 import os
+os.environ["TF_USE_CUDNN_RNN"] = "0"   # force pure-TF RNN kernels on Metal
 
 
 # (Optional while debugging) run tf.functions eagerly to avoid graph/XLA paths
@@ -49,7 +50,7 @@ USE_REGIME_EMBEDDING = True
 REGIME_EMB_DIM       = 4
 
 # Model / training
-MODEL_TYPE           = "TCN"         # "LSTM" | "TCN" | "TRANSFORMER"
+MODEL_TYPE           = "LSTM"         # "LSTM" | "TCN" | "TRANSFORMER"
 SEED                 = 0
 # --- Model / training ---
 AGG_TO_MINUTES = 5
@@ -138,6 +139,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import tensorflow as tf
+tf.config.set_visible_devices([], "GPU")  # run on CPU only
 from tensorflow.keras import Model # type: ignore
 from tensorflow.keras.layers import (Input, Dense, LSTM, Dropout, BatchNormalization, # type: ignore
                                      LeakyReLU, RepeatVector, TimeDistributed, Concatenate,
@@ -374,6 +376,7 @@ def load_alpaca_1m_df(
         raise last_err
     raise RuntimeError("Unknown error while fetching Alpaca bars.")
 # ------------------------------------------------------------
+
 # ------------------- Indicators & helpers ----------------------
 # After you load the first ticker df (post-aggregation), compute a safe SEQ_LEN:
 def infer_safe_seq_len(df, floor=32, frac=0.75):
@@ -914,27 +917,41 @@ def block_transformer(x, heads=4, dff=256, dropout=0.1):
 def build_generator(Fdim):
     z_in = Input(shape=(LATENT_DIM,))
     c_in = Input(shape=(SEQ_LEN, Fdim))
-    # context squeeze
+
+    # context squeeze from conditioning
     ctx = tf.keras.layers.GlobalAveragePooling1D()(c_in)
     ctx = Dense(64, activation="relu")(ctx)
+
+    # fuse z + ctx and lift to sequence
     h = Concatenate()([z_in, ctx])
     h = Dense(128, activation="relu")(h)
-    h = RepeatVector(SEQ_LEN)(h)
-    h = Concatenate(axis=-1)([h, c_in])
-    if MODEL_TYPE=="LSTM":
-        h = LSTM(128, return_sequences=True)(h)
-        h = LSTM(64, return_sequences=True)(h)
-    elif MODEL_TYPE=="TCN":
+    h = RepeatVector(SEQ_LEN)(h)          # (None, L, 128)
+    h = Concatenate(axis=-1)([h, c_in])   # (None, L, 128 + Fdim)
+
+    # ---- backbone (keep time dimension!) ----
+    if MODEL_TYPE == "LSTM":
+        # ensure both LSTMs keep sequences
+        h = LSTM(128, return_sequences=True, implementation=2, recurrent_dropout=0.0)(h)
+        h = LSTM(64,  return_sequences=True, implementation=2, recurrent_dropout=0.0)(h)
+    elif MODEL_TYPE == "TCN":
         h = block_tcn(h, ch=128, k=3, d=1)
         h = block_tcn(h, ch=128, k=3, d=2)
         h = block_tcn(h, ch=64,  k=3, d=4)
-    else:  # TRANSFORMER
+    else:  # "TRANSFORMER"
         h = Dense(128, activation="relu")(h)
         h = block_transformer(h, heads=4, dff=128)
         h = block_transformer(h, heads=4, dff=128)
-    h = TimeDistributed(Dense(32, activation="relu"))(h)
-    out = TimeDistributed(Dense(1, activation='tanh'))(h)
+
+    # ---- guard: if any branch collapsed time, re-inject it ----
+    # TimeDistributed expects rank-3
+    if len(h.shape) == 2:              # (None, features)
+        h = RepeatVector(SEQ_LEN)(h)   # -> (None, L, features)
+
+    # head
+    h   = TimeDistributed(Dense(32, activation="relu"))(h)
+    out = TimeDistributed(Dense(1, activation="tanh"))(h)
     return Model([z_in, c_in], out, name="G")
+
 
 # (Optional) tiny spectral norm for Conv/Dense
 class SpectralDense(Dense):
@@ -979,6 +996,8 @@ def build_critic(Fdim):
 
 G = build_generator(cond_dim)
 C = build_critic(cond_dim)
+print(G.summary())
+print(C.summary())
 
 # EMA generator
 if USE_G_EMA:
@@ -1257,6 +1276,71 @@ for epoch in range(1, EPOCHS + 1):
               f"W {_last(hist['w']):.4f} | REG {_last(hist['gp']):.4f} | "
               f"ADV {_last(hist['adv']):.4f} | AUX {_last(hist['aux']):.4f} | LR {lr:.2e}")
         print(_last(hist['w']), _last(hist['gp']))
+# ========= Trade plotting helpers =========
+def gen_crossover_trades(prices: pd.Series, fast: int = 10, slow: int = 30) -> pd.DataFrame:
+    """
+    Simple example trade list from a fast/slow MA crossover.
+    Returns a DataFrame with columns: time, side ('buy'|'sell'), price
+    """
+    f = prices.rolling(fast).mean()
+    s = prices.rolling(slow).mean()
+    pos = (f > s).astype(int)
+    chg = pos.diff().fillna(0)
+
+    buys_mask  = chg > 0
+    sells_mask = chg < 0
+
+    buys = pd.DataFrame({
+        "time": prices.index[buys_mask],
+        "side": "buy",
+        "price": prices[buys_mask].values
+    })
+    sells = pd.DataFrame({
+        "time": prices.index[sells_mask],
+        "side": "sell",
+        "price": prices[sells_mask].values
+    })
+    trades = pd.concat([buys, sells], ignore_index=True).sort_values("time")
+    return trades
+
+
+def plot_price_with_trades(prices: pd.Series,
+                           trades: pd.DataFrame,
+                           out_path: str,
+                           title: str | None = None):
+    """
+    Plot a price series with trade markers. 'trades' can have:
+      - column 'time' (datetime-like) and 'price' (optional) and 'side' ('buy'/'sell')
+      - or be indexed by time; if 'price' missing, it's pulled from prices at that timestamp
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    prices.plot(ax=ax, linewidth=1.2)
+
+    T = trades.copy()
+    if "time" in T.columns:
+        T = T.set_index("time")
+    if "price" not in T.columns:
+        T["price"] = prices.reindex(T.index)
+
+    # Normalize 'side' labels
+    side = T["side"].astype(str).str.lower()
+    buy_mask  = side.isin(["buy", "long", "entry", "+1"])
+    sell_mask = side.isin(["sell", "exit", "short", "-1"])
+
+    ax.scatter(T.index[buy_mask],  T.loc[buy_mask,  "price"], marker="^", s=60, label="Buy")
+    ax.scatter(T.index[sell_mask], T.loc[sell_mask, "price"], marker="v", s=60, label="Sell")
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Price")
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+# ==========================================
 
 # ----------------- diagnostics -----------------
 if hist["w"]:
@@ -1284,6 +1368,21 @@ plt.savefig(os.path.join(OUT_DIR, "critic_stats.png"), dpi=140); plt.close()
 plt.figure(figsize=(8,5)); plt.plot(hist["c"], label="Critic"); plt.plot(hist["g"], label="Generator")
 plt.plot(hist["adv"], label="G adv"); plt.plot(hist["aux"], label="G aux"); plt.legend(); plt.tight_layout()
 plt.savefig(os.path.join(OUT_DIR, "losses.png"), dpi=140); plt.close()
+
+# Use the already-fetched first ticker data
+prices_ex = first_df["Close"].astype(float)
+
+# Generate a toy trade list (fast/slow MA crossover)
+trades_ex = gen_crossover_trades(prices_ex, fast=10, slow=30)
+
+# Plot and save
+os.makedirs(OUT_DIR, exist_ok=True)
+plot_price_with_trades(
+    prices=prices_ex,
+    trades=trades_ex,
+    out_path=os.path.join(OUT_DIR, f"trades_{tickers[0]}_ma_crossover.png"),
+    title=f"{tickers[0]} — MA crossover trades"
+)
 
 # --------------- Evaluation (quick sanity metrics) -------------
 def ecdf(x):
@@ -1346,3 +1445,84 @@ with open(os.path.join(OUT_DIR, "eval_summary.json"), "w") as f:
 print("Eval:", {"ks":ks, "acf_dist":acf_dist, "real_pnl_mean":np.mean(pnl_r), "gen_pnl_mean":np.mean(pnl_g)})
 
 pd.DataFrame(gen_norm).to_csv(os.path.join(OUT_DIR, "generated_returns.csv"), index=False)
+# ===== Sidecar: export conditioning metadata for rl_trader.py =====
+def _to_float(x):
+    return float(x) if np.isfinite(x) else 0.0
+
+def save_conditioning_meta(out_dir,
+                           cond_dim,
+                           core_feat_names,
+                           ret_stats,         # list[(mean, std)] aligned with ret_vecs/meta
+                           feat_stats,        # list[list[(mean, std)]] aligned with feat_mats/meta
+                           meta,              # list of dicts with 'ticker' and 'sector'
+                           use_tic_emb, TICK_EMB, tic_to_ix,
+                           use_sec_emb, SECTOR_EMB, sector_to_ix,
+                           use_reg_emb, REGIME_EMB):
+    os.makedirs(out_dir, exist_ok=True)
+    # Map tickers -> stats
+    tickers_in_order = [m["ticker"] for m in meta]
+    ret_stats_map = {}
+    feat_stats_map = {}
+    for i, tk in enumerate(tickers_in_order):
+        rm, rs = ret_stats[i]
+        ret_stats_map[tk] = {"mean": _to_float(rm), "std": _to_float(rs)}
+        # per-column (mean,std)
+        feat_stats_map[tk] = [[_to_float(m), _to_float(s)] for (m, s) in feat_stats[i]]
+
+    sidecar = {
+        "cond_dim": int(cond_dim),
+        "core_feat_names": list(core_feat_names),
+        "ret_stats": ret_stats_map,
+        "feat_stats": feat_stats_map,
+        "use_ticker_embedding": bool(use_tic_emb),
+        "use_sector_embedding": bool(use_sec_emb),
+        "use_regime_embedding": bool(use_reg_emb),
+    }
+
+    # Ticker embedding block + names in the same order used in training
+    if use_tic_emb:
+        # make an ordered ticker list that aligns with TICK_EMB rows
+        inv_tic = [None] * len(tic_to_ix)
+        for k, v in tic_to_ix.items():
+            if v < len(inv_tic): inv_tic[v] = k
+        sidecar["ticker_embedding"] = {
+            "dim": int(TICK_EMB.shape[1]),
+            "tickers": inv_tic,
+            "matrix": TICK_EMB.astype(np.float32).tolist(),
+        }
+
+    if use_sec_emb:
+        # sector embedding + mapping from ticker -> sector name
+        inv_sec = [None] * len(sector_to_ix)
+        for s, i in sector_to_ix.items():
+            if i < len(inv_sec): inv_sec[i] = s
+        sidecar["sector_embedding"] = {
+            "dim": int(SECTOR_EMB.shape[1]),
+            "sectors": inv_sec,
+            "matrix": SECTOR_EMB.astype(np.float32).tolist(),
+            "ticker_to_sector": {m["ticker"]: m.get("sector", "UNKNOWN") for m in meta},
+        }
+
+    if use_reg_emb:
+        sidecar["regime_embedding"] = {
+            "dim": int(REGIME_EMB.shape[1]),
+            "matrix": REGIME_EMB.astype(np.float32).tolist(),
+        }
+
+    path = os.path.join(out_dir, "conditioning_meta.json")
+    with open(path, "w") as f:
+        json.dump(sidecar, f, indent=2)
+    print(f"[sidecar] Wrote {path}")
+
+# Call it once right after cond_dim/FZ_DIM printouts, before training:
+save_conditioning_meta(
+    out_dir=OUT_DIR,
+    cond_dim=cond_dim,
+    core_feat_names=core_feat_names,
+    ret_stats=ret_stats,
+    feat_stats=feat_stats,
+    meta=meta,
+    use_tic_emb=USE_TICKER_EMBEDDING, TICK_EMB=TICK_EMB if USE_TICKER_EMBEDDING else np.zeros((1,1), np.float32), tic_to_ix=tic_to_ix,
+    use_sec_emb=USE_SECTOR_EMBEDDING, SECTOR_EMB=SECTOR_EMB if USE_SECTOR_EMBEDDING else np.zeros((1,1), np.float32), sector_to_ix=sector_to_ix if USE_SECTOR_EMBEDDING else {"UNKNOWN":0},
+    use_reg_emb=USE_REGIME_EMBEDDING, REGIME_EMB=REGIME_EMB if USE_REGIME_EMBEDDING else np.zeros((1,1), np.float32),
+)

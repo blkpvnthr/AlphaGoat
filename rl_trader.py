@@ -20,7 +20,7 @@ from alpaca.data.enums import Adjustment, DataFeed
 import yfinance as yf
 
 # ========================= USER CONFIG (variables) =========================
-GAN_OUT_DIR         = "cwg_pro_out_AAPL-SPY_more"   # folder with G_best.keras/G_latest.keras (+ conditioning_meta.json)
+GAN_OUT_DIR         = "output"   # folder with G_best.keras/G_latest.keras (+ conditioning_meta.json)
 USE_GAN_SAMPLER     = True     # True: train on GAN-sampled returns using Alpaca conditioning; False: train only on real Alpaca windows
 GAN_MIX             = 1.0      # fraction of training episodes from GAN (0..1). If <1, remaining are real Alpaca windows
 
