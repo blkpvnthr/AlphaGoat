@@ -6,7 +6,7 @@ os.environ["TF_USE_CUDNN_RNN"] = "0"   # force pure-TF RNN kernels on Metal
 # tf.config.run_functions_eagerly(True)
 # ===============================================================
 #  gang-gang-pro.py  — Intraday Conditional WGAN-GP (Pro)
-#  • Alpaca 1m/60d + session-aware windowing (no cross-day leakage)
+#  • Alpaca 1m/90d + session-aware windowing (no cross-day leakage)
 #  • Per-ticker normalization, regime & calendar conditioning
 #  • Sector/ticker/regime embeddings
 #  • Model: LSTM / TCN / Transformer (switchable)
@@ -18,7 +18,7 @@ os.environ["TF_USE_CUDNN_RNN"] = "0"   # force pure-TF RNN kernels on Metal
 # ===================== USER SETTINGS (overridden by YAML if present) ==========
 TICKERS              = ["AAPL", "SPY", "FAKE"]    # FAKE -> FAKE_1, FAKE_2,...
 
-# Data (Alpaca 1m / 60d)
+# Data (Alpaca 1m / 90d)
 DAYS_BACK            = 90
 INTERVAL_MINUTES     = 1
 REG_HOURS_ONLY       = False
